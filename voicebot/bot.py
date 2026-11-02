@@ -28,7 +28,10 @@ class VoiceBot(commands.Bot):
 
     async def setup_hook(self) -> None:
         self.http_session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20))
-        self.openai = AsyncOpenAI(api_key=self.cfg.openai_api_key)
+        self.openai = AsyncOpenAI(
+            api_key=self.cfg.openai_api_key,
+            base_url=self.cfg.openai_base_url or None,  # None = real OpenAI
+        )
         await self.add_cog(VoiceCog(self))
 
     async def on_ready(self) -> None:
