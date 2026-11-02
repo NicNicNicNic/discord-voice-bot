@@ -180,8 +180,12 @@ class VoiceSession:
                 if len(text) < 2:
                     continue
                 log.info("%s: %s", name, text)
-                if self.cfg.wake_word and self.cfg.wake_word not in text.lower():
+                
+                # Clean up and check wake word
+                wake_word = getattr(self.cfg, "wake_word", "").strip().lower().strip('"\'')
+                if wake_word and wake_word not in text.lower():
                     continue
+                    
                 await self._respond(name, text)
             except asyncio.CancelledError:
                 raise
@@ -190,7 +194,7 @@ class VoiceSession:
                 await self._report(f"Voice pipeline error: `{exc}`")
 
     async def _respond(self, speaker: str, text: str) -> None:
-        self.speaking = True            # stop listening
+        self.speaking = True           # stop listening
         self._clear_buffers()
         play_q: asyncio.Queue = asyncio.Queue()
         player = asyncio.create_task(self._player(play_q))
