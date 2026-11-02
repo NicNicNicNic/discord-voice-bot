@@ -1,0 +1,1 @@
+"""Real-time Discord voice assistant: listen -> STT -> LLM -> TTS -> speak."""
