@@ -6,8 +6,8 @@ so it never answers itself or gets talked over mid-sentence.
 from __future__ import annotations
 
 import asyncio
-import io
 import logging
+import threading
 from collections import deque
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Optional
@@ -23,6 +23,51 @@ if TYPE_CHECKING:  # avoid a circular import at runtime
     from .bot import VoiceBot
 
 log = logging.getLogger("voicebot.session")
+
+SAMPLE_RATE = 48_000
+FRAME_BYTES = SAMPLE_RATE // 50 * 2 * 2   # 20 ms of 16-bit stereo = 3840 bytes
+
+
+class StreamSource(discord.AudioSource):
+    """One continuous audio stream per reply.
+
+    Sentences are appended as they finish synthesising. Until the stream is
+    finished, an empty buffer produces silence instead of ending, so Discord never
+    stops and restarts speaking between sentences - those restarts are what clip
+    the first word of a sentence. A short silent lead-in is also added so the very
+    first word isn't lost while Discord switches the "speaking" state on.
+    """
+
+    def __init__(self, lead_in_s: float = 0.3) -> None:
+        self._buf = bytearray(b"\x00" * (round(lead_in_s * 50) * FRAME_BYTES))
+        self._lock = threading.Lock()
+        self._finished = False
+
+    def feed(self, pcm: bytes) -> None:
+        with self._lock:
+            self._buf += pcm
+
+    def finish(self) -> None:
+        with self._lock:
+            self._finished = True
+
+    def read(self) -> bytes:  # called every 20 ms from discord's audio thread
+        with self._lock:
+            if len(self._buf) >= FRAME_BYTES:
+                frame = bytes(self._buf[:FRAME_BYTES])
+                del self._buf[:FRAME_BYTES]
+                return frame
+            if self._finished:
+                if not self._buf:
+                    return b""  # end of stream
+                frame = bytes(self._buf).ljust(FRAME_BYTES, b"\x00")  # pad the last partial frame
+                self._buf.clear()
+                return frame
+            return b"\x00" * FRAME_BYTES  # waiting for the next sentence: stay alive with silence
+
+    def is_opus(self) -> bool:
+        return False
+
 
 
 @dataclass
@@ -180,12 +225,11 @@ class VoiceSession:
                 if len(text) < 2:
                     continue
                 log.info("%s: %s", name, text)
-                
-                # Clean up and check wake word
-                wake_word = getattr(self.cfg, "wake_word", "").strip().lower().strip('"\'')
-                if wake_word and wake_word not in text.lower():
+
+                # Only react if a wake word was said (WAKE_WORD may be a comma-separated list)
+                if not self.cfg.heard_wake_word(text):
                     continue
-                    
+
                 await self._respond(name, text)
             except asyncio.CancelledError:
                 raise
@@ -200,7 +244,9 @@ class VoiceSession:
         player = asyncio.create_task(self._player(play_q))
         try:
             buf = ""
+            reply = ""
             async for delta in self.brain.stream_reply(f"{speaker}: {text}"):
+                reply += delta
                 buf += delta
                 sentences, buf = split_sentences(buf)
                 for s in sentences:
@@ -208,6 +254,8 @@ class VoiceSession:
                     await play_q.put(asyncio.create_task(self.dg.synthesize(s)))
             if buf.strip():
                 await play_q.put(asyncio.create_task(self.dg.synthesize(buf.strip())))
+            if reply.strip():
+                log.info("bot: %s", reply.strip())
         finally:
             await play_q.put(None)
             await player
@@ -216,20 +264,35 @@ class VoiceSession:
             self.speaking = False
 
     async def _player(self, q: asyncio.Queue) -> None:
-        while True:
-            item = await q.get()
-            if item is None:
-                return
-            try:
-                audio = await item
-            except Exception as exc:
-                log.error("TTS failed: %s", exc)
-                continue
-            await self._play(audio)
+        """Turn queued TTS results into ONE continuous Discord audio stream per reply."""
+        source = StreamSource(self.cfg.playback_lead_in_s)
+        done: Optional[asyncio.Future] = None
+        started = False
+        try:
+            while True:
+                item = await q.get()
+                if item is None:
+                    break
+                try:
+                    pcm = await self._decode(await item)
+                except Exception as exc:
+                    log.error("TTS/decode failed: %s", exc)
+                    continue
+                source.feed(pcm)
+                if not started:  # start playing as soon as the first sentence is ready
+                    started = True
+                    done = self._start_playback(source)
+        finally:
+            source.finish()  # lets the stream end once its buffer has drained
+        if done is not None:
+            err = await done
+            if err:
+                log.error("playback error: %s", err)
 
-    async def _play(self, audio: bytes) -> None:
+    def _start_playback(self, source: StreamSource) -> Optional[asyncio.Future]:
         if not self.vc.is_connected():
-            return
+            log.warning("not connected to voice - skipping playback")
+            return None
         done: asyncio.Future = self.loop.create_future()
 
         def after(err: Optional[Exception]) -> None:  # runs in discord's player thread
@@ -238,13 +301,30 @@ class VoiceSession:
                     done.set_result(err)
             self.loop.call_soon_threadsafe(_set)
 
-        source = discord.FFmpegPCMAudio(
-            io.BytesIO(audio), pipe=True, executable=self.cfg.ffmpeg_path, options="-vn"
-        )
-        self.vc.play(source, after=after)
-        err = await done
-        if err:
-            log.error("playback error: %s", err)
+        try:
+            self.vc.play(source, after=after)
+        except Exception:
+            log.exception("could not start playback")
+            return None
+        log.info("playing reply")
+        return done
+
+    async def _decode(self, audio: bytes) -> bytes:
+        """MP3/WAV bytes -> raw 48 kHz stereo 16-bit PCM (what Discord wants), via FFmpeg."""
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                self.cfg.ffmpeg_path, "-loglevel", "error", "-i", "pipe:0",
+                "-f", "s16le", "-ar", str(SAMPLE_RATE), "-ac", "2", "pipe:1",
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+        except FileNotFoundError:
+            raise RuntimeError(f"FFmpeg not found at '{self.cfg.ffmpeg_path}'. Set FFMPEG_PATH in .env.")
+        out, err = await proc.communicate(audio)
+        if proc.returncode != 0:
+            raise RuntimeError(f"FFmpeg failed: {err.decode(errors='ignore')[:200]}")
+        return out
 
     async def _report(self, message: str) -> None:
         """Post an error to the text channel, at most once every 30 s."""

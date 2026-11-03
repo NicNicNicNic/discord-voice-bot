@@ -1,6 +1,7 @@
 """LLM side: streamed OpenAI replies, sliding memory, and sentence splitting."""
 from __future__ import annotations
 
+import logging
 import re
 from collections import deque
 from typing import AsyncIterator
@@ -8,6 +9,8 @@ from typing import AsyncIterator
 from openai import AsyncOpenAI
 
 from .config import VOICE_RULES, Config
+
+log = logging.getLogger("voicebot.brain")
 
 _SENT_RE = re.compile(r"(?<=[.!?])\s+|\n+")
 
@@ -47,7 +50,13 @@ class Brain:
         messages += list(self.history)
         messages.append({"role": "user", "content": user_text})
 
+        kwargs: dict = {}
+        if self.cfg.reasoning_effort:
+            # Reasoning models (e.g. gpt-oss) "think" before answering; low = faster, fewer tokens.
+            kwargs["reasoning_effort"] = self.cfg.reasoning_effort
+
         parts: list[str] = []
+        finish = None
         try:
             stream = await self.client.chat.completions.create(
                 model=self.cfg.openai_model,
@@ -55,14 +64,24 @@ class Brain:
                 stream=True,
                 max_tokens=self.cfg.max_reply_tokens,
                 temperature=0.8,
+                **kwargs,
             )
             async for chunk in stream:
                 if not chunk.choices:
                     continue
-                delta = chunk.choices[0].delta.content
+                choice = chunk.choices[0]
+                if choice.finish_reason:
+                    finish = choice.finish_reason
+                delta = choice.delta.content
                 if delta:
                     parts.append(delta)
                     yield delta
+            if not parts:
+                log.warning(
+                    "LLM returned an EMPTY reply (finish_reason=%s). With a reasoning model this "
+                    "usually means the thinking used up all the tokens: set REASONING_EFFORT=low "
+                    "and/or raise MAX_REPLY_TOKENS in .env.", finish,
+                )
         finally:
             if parts:
                 self.history.append({"role": "user", "content": user_text})

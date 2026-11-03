@@ -15,8 +15,11 @@ DEFAULT_PERSONA = (
 
 # Always appended to the persona so replies sound good when spoken aloud.
 VOICE_RULES = (
-    "You are speaking out loud in a voice channel. Reply in one to three short, "
-    "natural spoken sentences. No markdown, lists, emojis or code. "
+    "You are speaking out loud in a voice channel. Use only plain words that sound natural "
+    "when spoken: no markdown, lists, bullet points, symbols, emojis or code. "
+    "Match your length to the question: quick reactions and roasts stay to a sentence or two, "
+    "but real questions (strategy, where to go, what to do) deserve a complete answer of "
+    "roughly three to six sentences. Never ramble or repeat yourself. "
     "Each user message is prefixed with the speaker's name."
 )
 
@@ -28,6 +31,17 @@ def _env(name: str, default: Optional[str] = None) -> str:
     return value
 
 
+def _load_persona() -> str:
+    """Persona priority: persona.txt (or PERSONA_FILE) > BOT_PERSONA in .env > built-in default."""
+    path = os.getenv("PERSONA_FILE", "persona.txt")
+    if os.path.isfile(path):
+        with open(path, encoding="utf-8") as f:
+            text = f.read().strip()
+        if text:
+            return text
+    return os.getenv("BOT_PERSONA", DEFAULT_PERSONA)
+
+
 @dataclass
 class Config:
     discord_token: str
@@ -37,9 +51,11 @@ class Config:
     persona: str = DEFAULT_PERSONA
     openai_model: str = "gpt-4o-mini"
     openai_base_url: str = ""         # optional: point at any OpenAI-compatible provider
+    reasoning_effort: str = ""        # optional: low/medium/high, for reasoning models like gpt-oss
     stt_model: str = "nova-3"
     stt_language: str = "en"
     tts_model: str = "aura-2-thalia-en"
+    tts_encoding: str = "mp3"         # "mp3" (small) or "linear16" (uncompressed WAV, clearer)
     max_turns: int = 10               # sliding memory: last N user/assistant turns
     max_reply_tokens: int = 120       # keep spoken answers short (and fast)
     vad_threshold: float = 600.0      # RMS (int16) above which a frame counts as speech
@@ -49,6 +65,17 @@ class Config:
     post_speech_cooldown_s: float = 0.4  # keep ignoring input briefly after we talk
     wake_word: str = ""               # optional; if set, only respond when heard
     ffmpeg_path: str = "ffmpeg"
+    playback_lead_in_s: float = 0.3   # silence before each reply so Discord does not clip the first word
+
+    @property
+    def wake_words(self) -> list[str]:
+        """WAKE_WORD can be one word or a comma-separated list: master,serge,private"""
+        return [w.strip().strip('"\'').lower() for w in self.wake_word.split(",") if w.strip()]
+
+    def heard_wake_word(self, text: str) -> bool:
+        """True if no wake word is configured, or any of them appears in `text`."""
+        words = self.wake_words
+        return not words or any(w in text.lower() for w in words)
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -58,16 +85,19 @@ class Config:
             openai_api_key=_env("OPENAI_API_KEY"),
             deepgram_api_key=_env("DEEPGRAM_API_KEY"),
             prefix=os.getenv("COMMAND_PREFIX", "!"),
-            persona=os.getenv("BOT_PERSONA", DEFAULT_PERSONA),
+            persona=_load_persona(),
             openai_model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
             openai_base_url=os.getenv("OPENAI_BASE_URL", "").strip(),
+            reasoning_effort=os.getenv("REASONING_EFFORT", "").strip().lower(),
             stt_model=os.getenv("DEEPGRAM_STT_MODEL", "nova-3"),
             stt_language=os.getenv("DEEPGRAM_LANGUAGE", "en"),
             tts_model=os.getenv("DEEPGRAM_TTS_MODEL", "aura-2-thalia-en"),
+            tts_encoding=os.getenv("DEEPGRAM_TTS_ENCODING", "mp3").strip().lower(),
             max_turns=int(os.getenv("MAX_TURNS", "10")),
             max_reply_tokens=int(os.getenv("MAX_REPLY_TOKENS", "120")),
             vad_threshold=float(os.getenv("VAD_THRESHOLD", "600")),
             silence_s=float(os.getenv("SILENCE_MS", "700")) / 1000,
             wake_word=os.getenv("WAKE_WORD", "").strip().lower(),
             ffmpeg_path=os.getenv("FFMPEG_PATH", "ffmpeg"),
+            playback_lead_in_s=float(os.getenv("PLAYBACK_LEAD_IN_MS", "300")) / 1000,
         )

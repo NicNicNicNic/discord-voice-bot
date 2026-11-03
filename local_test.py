@@ -229,7 +229,7 @@ async def run_mic(cfg, brain, dg, args) -> None:
                     print(f"you> {text}  [STT {time.perf_counter() - t:.2f}s]")
                     if len(text) < 2:
                         print("  (nothing recognised)")
-                    elif cfg.wake_word and cfg.wake_word not in text.lower():
+                    elif not cfg.heard_wake_word(text):
                         print("  (wake word not heard - ignoring)")
                     else:
                         await respond(cfg, brain, dg, args, counter, "Tester", text)
